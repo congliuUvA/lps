@@ -223,7 +223,7 @@ class VNN(nn.Module):
         self.head1 = nn.Linear(self.pooled_dim*6 + self.dim*6, 1)
         # permutation invariant pooling
         self.pool3 = VNMaxPool(self.dim)
-        self.head2 = VNLinear(self.dim, 3)
+        self.head2 = VNLinear(self.dim, 3) 
 
     def _permutation_invariant_rotation_equivariant_pool(self, x):
         b, c, _, n = x.shape
@@ -279,7 +279,152 @@ class VNN(nn.Module):
         assert pseudo_hs.shape == (b, n) and pseudo_ks.shape == (b, 3, 3)
         return pseudo_hs, pseudo_ks
 
+def _norm_no_nan(x, axis=-1, keepdims=False, eps=1e-8, sqrt=True):
+    """
+    L2 norm of tensor clamped above a minimum value `eps`.
+    :param sqrt: if `False`, returns the square of the L2 norm
+    """
+    out = torch.clamp(torch.sum(torch.square(x), axis, keepdims), min=eps)
+    return torch.sqrt(out) if sqrt else out
 
+
+class LinearFullyConnectedDotProductLayer(nn.Module):
+    def __init__(self, in_vec_dims, hidden_vec_dims, out_scalar_dims, residual=False):
+        super().__init__()
+        self.linear_left = nn.Linear(in_vec_dims, hidden_vec_dims, bias=False)
+        self.linear_right = nn.Linear(in_vec_dims, hidden_vec_dims, bias=False)
+        self.linear_out = nn.Linear(hidden_vec_dims, out_scalar_dims)
+        self.residual = residual 
+
+    def forward(self, vec):
+        # normalization
+        vec_right = self.linear_right(vec)
+        vec_left = self.linear_left(vec)
+
+        # dot product
+        dot = (vec_left * vec_right).sum(dim=1)
+
+        if self.residual:
+            vec_norm = _norm_no_nan(vec, axis=-2, keepdims=True)
+            dot += vec_norm
+        dot = self.linear_out(dot)
+        return dot
+    
+
+class GVPLinear(nn.Module):
+    """
+    Geometric Vector Perceptron. See manuscript and README.md
+    for more details.
+
+    :param in_dims: tuple (n_scalar, n_vector)
+    :param out_dims: tuple (n_scalar, n_vector)
+    :param h_dim: intermediate number of vector channels, optional
+    :param activations: tuple of functions (scalar_act, vector_act)
+    :param vector_gate: whether to use vector gating.
+                        (vector_act will be used as sigma^+ in vector gating if `True`)
+    """
+
+    def __init__(
+        self,
+        in_dims,
+        out_dims,
+        h_dim=None,
+        activations=(F.relu, torch.sigmoid),
+        vector_gate=False,
+    ):
+        super().__init__()
+        self.si, self.vi = in_dims
+        self.so, self.vo = out_dims
+        self.vector_gate = vector_gate
+        if self.vi:
+            self.h_dim = h_dim or max(self.vi, self.vo)
+            self.dot_prod = LinearFullyConnectedDotProductLayer(self.vi, self.h_dim, self.h_dim)
+            # self.cross_prod = LinearFullyConnectedCrossProductLayer(self.vi, self.h_dim, self.h_dim)
+            self.wh = nn.Linear(self.vi, self.h_dim, bias=False)
+            self.ws = nn.Linear(self.h_dim + self.si, self.so)
+            if self.vo:
+                self.wv = nn.Linear(self.h_dim, self.vo, bias=False)
+                if self.vector_gate:
+                    self.wsv = nn.Linear(self.so, self.vo)
+        else:
+            self.ws = nn.Linear(self.si, self.so)
+
+        self.scalar_act, self.vector_act = activations
+        self.dummy_param = nn.Parameter(torch.empty(0))
+
+    def forward(self, x):
+        """
+        :param x: tuple (s, V) of `torch.Tensor`,
+                  or (if vectors_in is 0), a single `torch.Tensor`
+        :return: tuple (s, V) of `torch.Tensor`,
+                 or (if vectors_out is 0), a single `torch.Tensor`
+        """
+        if self.vi:
+            s, v = x
+            v = torch.transpose(v, -1, -2)
+            vn = self.dot_prod(v)
+            # v_cross_dot = self.cross_prod(v)
+            s = self.ws(torch.cat([s, vn], -1))
+            vh = self.wh(v)
+            if self.vo:
+                v = self.wv(vh)
+                v = torch.transpose(v, -1, -2)
+                if self.vector_gate:
+                    if self.vector_act:
+                        gate = self.wsv(self.vector_act(s))
+                    else:
+                        gate = self.wsv(s)
+                    v = v * torch.sigmoid(gate).unsqueeze(-1)
+                elif self.vector_act:
+                    v = v * self.vector_act(_norm_no_nan(v, axis=-1, keepdims=True))
+        else:
+            s = self.ws(x)
+            if self.vo:
+                v = torch.zeros(s.shape[0], self.vo, 5, device=self.dummy_param.device)
+        if self.scalar_act:
+            s = self.scalar_act(s)
+
+        return (s, v) if self.vo else s
+    
+class NaiveDVP(nn.Module):
+    def __init__(
+        self,
+        in_features_s=1,
+        in_features_v=2,
+        hidden_features_s=64,
+        hidden_features_v=4,
+        out_features_s=1,
+        out_features_v=3,
+    ):
+        super().__init__()
+        self.feature_embedding = GVPLinear(
+                (in_features_s, in_features_v),
+                (hidden_features_s, hidden_features_v),
+                vector_gate=True,
+                activations=(None, None),
+            )
+        self.projection = GVPLinear(
+                (hidden_features_s, hidden_features_v),
+                (out_features_s, out_features_v),
+                vector_gate=True, 
+                activations=(None, None),
+            )
+
+
+    def _forward(self, x):
+        x = self.feature_embedding(x)
+        x = self.projection(x)
+        s, v = x
+        return s, v
+    
+    def forward(self, x):
+        b, c, _, n = x.shape
+        assert x.shape == (b, c, 3, n)  
+        x = x.permute(0, 3, 1, 2).reshape(b*n, c, 3)
+        dist = torch.norm(x[:, 0], dim=-1, keepdim=True)
+        s, v = self._forward((dist, x))
+        return s.reshape(b, n), v.reshape(b, n, 3, 3).mean(dim=1)
+    
 class EquivariantInterface(nn.Module):
     def __init__(
         self,
@@ -302,12 +447,16 @@ class EquivariantInterface(nn.Module):
         self.noise_scale = noise_scale
         self.tau = tau
         self.hard = hard
-        self.vnn_interface = VNN(
-            input_dim=2,
-            hidden_dim=vnn_hidden_dim,
-            n_knn=vnn_k_nearest_neighbors,
-            dropout=vnn_dropout
-        )
+        # self.vnn_interface = VNN(
+        #     input_dim=2,
+        #     hidden_dim=vnn_hidden_dim,
+        #     n_knn=vnn_k_nearest_neighbors,
+        #     dropout=vnn_dropout
+        # )
+        # self.vnn_interface = CliffordMPNN()
+        # self.vnn_interface = Clifford()
+        # self.vnn_interface = NbodyDotProd()
+        self.vnn_interface = NaiveDVP()
         self.compute_entropy_loss = PermutaionMatrixPenalty(n=5)
 
     def _postprocess_permutation(self, pseudo_hs: T, sinkhorn_iter=20):
